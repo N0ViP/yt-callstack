@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Call Stack</title>
+  <style>
+    :root {
+      --bg: #0f0f0f;
+      --surface: #212121;
+      --surface-hover: #272727;
+      --border: rgba(255, 255, 255, 0.1);
+      --border-subtle: rgba(255, 255, 255, 0.06);
+      --text-primary: #f1f1f1;
+      --text-secondary: #aaaaaa;
+      --text-muted: #717171;
+      --pill-bg: rgba(255, 255, 255, 0.1);
+      --pill-hover: rgba(255, 255, 255, 0.2);
+      --font: "Roboto", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      width: 360px;
+      max-height: 520px;
+      background-color: var(--bg);
+      color: var(--text-primary);
+      font-family: var(--font);
+      font-size: 13px;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      background-color: var(--bg);
+      border-bottom: 1px solid var(--border-subtle);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .brand-icon {
+      width: 20px;
+      height: 20px;
+      color: var(--text-primary);
+    }
+
+    .brand-icon svg {
+      width: 100%;
+      height: 100%;
+      fill: currentColor;
+    }
+
+    .brand-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+
+    .depth-chip {
+      font-size: 11px;
+      font-weight: 500;
+      padding: 1px 7px;
+      border-radius: 9px;
+      background-color: var(--pill-bg);
+      color: var(--text-secondary);
+    }
+
+    .depth-chip.has-items {
+      background-color: rgba(255, 255, 255, 0.2);
+      color: var(--text-primary);
+    }
+
+    /* Actions Bar */
+    .actions-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      background-color: var(--bg);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .btn-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      padding: 0 12px;
+      height: 28px;
+      background-color: var(--pill-bg);
+      color: var(--text-primary);
+      border: none;
+      border-radius: 14px;
+      font-family: var(--font);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background-color 0.15s ease, opacity 0.15s ease;
+      user-select: none;
+    }
+
+    .btn-pill svg {
+      width: 14px;
+      height: 14px;
+      fill: currentColor;
+    }
+
+    .btn-pill:hover:not(:disabled) {
+      background-color: var(--pill-hover);
+    }
+
+    .btn-pill:disabled {
+      opacity: 0.35;
+      cursor: default;
+    }
+
+    .btn-text {
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      font-family: var(--font);
+      font-size: 12px;
+      font-weight: 500;
+      padding: 0 6px;
+      height: 28px;
+      cursor: pointer;
+      transition: color 0.15s ease;
+    }
+
+    .btn-text:hover:not(:disabled) {
+      color: var(--text-primary);
+    }
+
+    .btn-text:disabled {
+      opacity: 0.3;
+      cursor: default;
+    }
+
+    /* Active Video Banner */
+    .active-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 14px;
+      background-color: var(--surface);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .active-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .active-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--text-secondary);
+      font-weight: 500;
+    }
+
+    .active-title {
+      font-size: 12px;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .btn-push-active {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 0 10px;
+      height: 26px;
+      background-color: #f1f1f1;
+      color: #0f0f0f;
+      border: none;
+      border-radius: 13px;
+      font-family: var(--font);
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .btn-push-active:hover {
+      background-color: #ffffff;
+    }
+
+    /* Stack Container */
+    .stack-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px;
+      min-height: 120px;
+    }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 16px;
+      text-align: center;
+    }
+
+    .empty-icon {
+      width: 32px;
+      height: 32px;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }
+
+    .empty-icon svg {
+      width: 100%;
+      height: 100%;
+      fill: currentColor;
+    }
+
+    .empty-title {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary);
+      margin-bottom: 4px;
+    }
+
+    .empty-desc {
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text-secondary);
+      max-width: 250px;
+    }
+
+    /* Frame Card */
+    .frame-card {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background-color 0.12s ease;
+      margin-bottom: 2px;
+    }
+
+    .frame-card:hover {
+      background-color: var(--surface-hover);
+    }
+
+    .frame-card.is-top {
+      border-left: 2px solid var(--text-primary);
+      background-color: rgba(255, 255, 255, 0.04);
+    }
+
+    .frame-thumb-box {
+      position: relative;
+      width: 68px;
+      height: 38px;
+      border-radius: 4px;
+      overflow: hidden;
+      background-color: #000;
+      flex-shrink: 0;
+    }
+
+    .frame-thumb {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .frame-time-pill {
+      position: absolute;
+      bottom: 2px;
+      right: 2px;
+      background: rgba(0, 0, 0, 0.85);
+      color: #fff;
+      font-size: 9px;
+      padding: 1px 3px;
+      border-radius: 2px;
+      line-height: 1;
+    }
+
+    .frame-details {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .frame-title {
+      font-size: 12px;
+      color: var(--text-primary);
+      line-height: 1.3;
+      max-height: 2.6em;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      margin-bottom: 2px;
+    }
+
+    .frame-meta {
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+
+    .frame-actions {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      flex-shrink: 0;
+      opacity: 0;
+      transition: opacity 0.12s ease;
+    }
+
+    .frame-card:hover .frame-actions {
+      opacity: 1;
+    }
+
+    .btn-action-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      background: transparent;
+      border: none;
+      border-radius: 50%;
+      color: var(--text-secondary);
+      cursor: pointer;
+    }
+
+    .btn-action-icon svg {
+      width: 14px;
+      height: 14px;
+      fill: currentColor;
+    }
+
+    .btn-action-icon:hover {
+      background: var(--pill-bg);
+      color: var(--text-primary);
+    }
+
+    /* Footer */
+    .footer {
+      padding: 8px 14px;
+      background-color: var(--bg);
+      border-top: 1px solid var(--border-subtle);
+      font-size: 11px;
+      color: var(--text-secondary);
+      display: flex;
+      justify-content: space-between;
+    }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="brand">
+      <div class="brand-icon">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z"/></svg>
+      </div>
+      <span class="brand-title">Call Stack</span>
+    </div>
+    <span id="depth-badge" class="depth-chip">0</span>
+  </header>
+
+  <!-- Actions Bar -->
+  <div class="actions-bar">
+    <button id="btn-pop-top" class="btn-pill" title="Pop top video and return (Alt+P)">
+      <svg viewBox="0 0 24 24"><path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/></svg>
+      <span>Pop Top</span>
+    </button>
+    <button id="btn-clear-all" class="btn-text" title="Clear all">Clear</button>
+  </div>
+
+  <!-- Active Video Banner -->
+  <div id="active-video-banner" class="active-banner">
+    <div class="active-info">
+      <div class="active-label">Watching</div>
+      <div id="active-video-title" class="active-title">Loading...</div>
+    </div>
+    <button id="btn-push-active" class="btn-push-active" title="Save to Call Stack">
+      Push
+    </button>
+  </div>
+
+  <!-- Stack Container -->
+  <main id="stack-container" class="stack-container">
+    <!-- Rendered by popup.js -->
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <span>Alt + Click / Alt + S : Push</span>
+    <span>Alt + P : Pop</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
