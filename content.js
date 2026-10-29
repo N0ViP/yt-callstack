@@ -15,6 +15,20 @@
   let isPushLocked = false;
   let shadowRoot = null;
   let hostEl = null;
+  // In-memory pending restore — avoids a storage round-trip on every page transition.
+  let pendingRestore = null;
+
+  /* ==========================================================================
+     0. Unhandled Rejection Suppression
+     Silences extension-context errors if an orphaned tab outlives an extension update.
+     ========================================================================== */
+
+  window.addEventListener('unhandledrejection', (e) => {
+    const msg = e && e.reason && e.reason.message ? e.reason.message : '';
+    if (msg.includes('Extension context invalidated') || msg.includes('extension context')) {
+      e.preventDefault();
+    }
+  });
 
   /* ==========================================================================
      1. Lightweight Helpers
@@ -100,22 +114,66 @@
      2. Instant Client-Side SPA Navigation (Zero Full-Page Reloads)
      ========================================================================== */
 
-  function triggerSpaNavigate(url) {
-    const a = document.createElement('a');
-    a.href = url;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    const clickEvt = new MouseEvent('click', {
-      view: window,
-      bubbles: true,
-      cancelable: true,
-      altKey: false,
-      ctrlKey: false,
-      metaKey: false,
-      shiftKey: false
-    });
-    a.dispatchEvent(clickEvt);
-    a.remove();
+  function triggerSpaNavigate(url, videoId = null, startTimeSeconds = 0) {
+    const cleanUrl = url.startsWith('/') ? url : '/' + url;
+    const timeSec = Math.floor(startTimeSeconds || 0);
+    const ytdApp = document.querySelector('ytd-app');
+
+    // 1. YouTube Native Client SPA Event ('yt-navigate')
+    // Dispatched directly on <ytd-app>, this triggers YouTube's internal Polymer router
+    // without ANY browser navigation or reload overhead.
+    if (ytdApp && videoId) {
+      try {
+        const navEvt = new CustomEvent('yt-navigate', {
+          bubbles: true,
+          composed: true,
+          detail: {
+            endpoint: {
+              clickTrackingParams: '',
+              commandMetadata: {
+                webCommandMetadata: {
+                  url: cleanUrl,
+                  webPageType: 'WEB_PAGE_TYPE_WATCH',
+                  rootVe: 3832
+                }
+              },
+              watchEndpoint: {
+                videoId: videoId,
+                startTimeSeconds: timeSec
+              }
+            }
+          }
+        });
+        ytdApp.dispatchEvent(navEvt);
+      } catch (e) {}
+    }
+
+    // 2. Synthetic anchor click with composed: true attached INSIDE <ytd-app>
+    // Appending inside <ytd-app> with composed: true ensures YouTube's Polymer router
+    // intercepts the bubbling click rather than falling back to a slow full-page reload.
+    const container = ytdApp || document.body || document.documentElement;
+    try {
+      const a = document.createElement('a');
+      a.className = 'yt-simple-endpoint';
+      a.href = cleanUrl;
+      a.style.display = 'none';
+      container.appendChild(a);
+
+      const clickEvt = new MouseEvent('click', {
+        view: window,
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        altKey: false,
+        ctrlKey: false,
+        metaKey: false,
+        shiftKey: false
+      });
+      a.dispatchEvent(clickEvt);
+      a.remove();
+    } catch (e) {
+      window.location.href = cleanUrl;
+    }
   }
 
   /* ==========================================================================
@@ -175,26 +233,26 @@
         pushedAt: Date.now()
       };
 
-      const data = await chrome.storage.local.get(STORAGE_KEY);
-      const stack = Array.isArray(data[STORAGE_KEY]) ? data[STORAGE_KEY] : [];
+      // Use in-memory stack for deduplication — no storage read needed.
+      const stack = currentStack;
       const alreadyIn = stack.some(item => item.videoId === vidId);
-
-      // Strict Deduplication: video appears at most once in stack
       const filtered = stack.filter(item => item.videoId !== vidId);
       const newStack = [frame, ...filtered];
 
-      await chrome.storage.local.set({ [STORAGE_KEY]: newStack });
+      // Update in-memory immediately (UI feels instant).
       currentStack = newStack;
+      renderDock();
+
+      // Persist in background (non-blocking).
+      chrome.storage.local.set({ [STORAGE_KEY]: newStack }).catch(() => {});
 
       if (showNotification) {
         showToast(
           alreadyIn ? `Updated in stack • ${formatTimestamp(savedTime)}` : `Saved to stack • ${formatTimestamp(savedTime)}`,
           'POP',
-          () => popTopFrame(0)
+          () => popTopFrame(0).catch(() => {})
         );
       }
-
-      renderDock();
     } catch (e) {
     } finally {
       setTimeout(() => { isPushLocked = false; }, 200);
@@ -209,63 +267,63 @@
     if (!isExtensionValid()) return;
     dismissAutopop();
 
-    try {
-      const data = await chrome.storage.local.get(STORAGE_KEY);
-      const stack = Array.isArray(data[STORAGE_KEY]) ? data[STORAGE_KEY] : [];
-      if (!stack.length || index >= stack.length) return;
+    // Use the already-up-to-date in-memory stack — no storage read needed.
+    const stack = currentStack;
+    if (!stack.length || index >= stack.length) return;
 
-      const targetFrame = stack[index];
-      const remaining = stack.filter((_, idx) => idx !== index);
-      const targetTime = Math.max(0, (targetFrame.savedTimestamp || 0) - 3);
+    const targetFrame = stack[index];
+    const remaining = stack.filter((_, idx) => idx !== index);
+    const targetTime = Math.max(0, (targetFrame.savedTimestamp || 0) - 3);
 
-      await chrome.storage.local.set({
-        [STORAGE_KEY]: remaining,
-        [RESTORE_KEY]: {
-          videoId: targetFrame.videoId,
-          savedTimestamp: targetFrame.savedTimestamp,
-          playbackRate: targetFrame.playbackRate || 1,
-          title: targetFrame.title,
-          isPopping: true,
-          timestampSetAt: Date.now()
-        }
-      });
+    // Update in-memory state immediately (zero latency for UI).
+    currentStack = remaining;
+    renderDock();
 
-      currentStack = remaining;
-      renderDock();
+    // Set the pending restore in-memory so onPageTransition can apply it
+    // instantly without another storage round-trip.
+    pendingRestore = {
+      videoId: targetFrame.videoId,
+      savedTimestamp: targetFrame.savedTimestamp,
+      playbackRate: targetFrame.playbackRate || 1,
+      isPopping: true,
+      timestampSetAt: Date.now()
+    };
 
-      const currentVidId = getCurrentVideoId();
-      if (currentVidId === targetFrame.videoId) {
-        // Same video: seek immediately in 0ms without any network transition
-        applyRestore(targetTime, targetFrame.playbackRate || 1);
-        showToast(`Resumed at ${formatTimestamp(targetTime + 3)}`);
-      } else {
-        // Different video: navigate via YouTube's native SPA router in 50-100ms
-        triggerSpaNavigate(`/watch?v=${targetFrame.videoId}&t=${Math.floor(targetTime)}s`);
-      }
-    } catch (e) {}
+    // Persist to storage in the background (non-blocking).
+    // This is only needed so background.js fallback pop also works.
+    chrome.storage.local.set({
+      [STORAGE_KEY]: remaining,
+      [RESTORE_KEY]: pendingRestore
+    }).catch(() => {});
+
+    const currentVidId = getCurrentVideoId();
+    if (currentVidId === targetFrame.videoId) {
+      // Same video already loaded — seek instantly, no navigation at all.
+      pendingRestore = null;
+      applyRestore(targetTime, targetFrame.playbackRate || 1);
+      showToast(`Resumed at ${formatTimestamp(targetTime + 3)}`);
+    } else {
+      // Different video — SPA navigate. pendingRestore will be consumed by
+      // checkAndApplyPendingRestore() when yt-navigate-finish fires.
+      triggerSpaNavigate(`/watch?v=${targetFrame.videoId}&t=${Math.floor(targetTime)}s`, targetFrame.videoId, targetTime);
+    }
   }
 
   async function removeFrame(index) {
     if (!isExtensionValid()) return;
-    try {
-      const data = await chrome.storage.local.get(STORAGE_KEY);
-      const stack = Array.isArray(data[STORAGE_KEY]) ? data[STORAGE_KEY] : [];
-      if (index < 0 || index >= stack.length) return;
-
-      const newStack = stack.filter((_, idx) => idx !== index);
-      await chrome.storage.local.set({ [STORAGE_KEY]: newStack });
-      currentStack = newStack;
-      renderDock();
-    } catch (e) {}
+    const stack = currentStack;
+    if (index < 0 || index >= stack.length) return;
+    const newStack = stack.filter((_, idx) => idx !== index);
+    currentStack = newStack;
+    renderDock();
+    chrome.storage.local.set({ [STORAGE_KEY]: newStack }).catch(() => {});
   }
 
   async function clearStack() {
     if (!isExtensionValid()) return;
-    try {
-      await chrome.storage.local.set({ [STORAGE_KEY]: [] });
-      currentStack = [];
-      renderDock();
-    } catch (e) {}
+    currentStack = [];
+    renderDock();
+    chrome.storage.local.set({ [STORAGE_KEY]: [] }).catch(() => {});
   }
 
   /* ==========================================================================
@@ -278,7 +336,9 @@
 
     try {
       video.currentTime = targetTime;
-      video.playbackRate = playbackRate;
+      if (playbackRate && video.playbackRate !== playbackRate) {
+        video.playbackRate = playbackRate;
+      }
     } catch (e) {}
 
     const moviePlayer = document.getElementById('movie_player');
@@ -295,32 +355,54 @@
   async function checkAndApplyPendingRestore() {
     if (!isExtensionValid()) return;
     try {
-      const data = await chrome.storage.local.get(RESTORE_KEY);
-      const pending = data[RESTORE_KEY];
-      if (!pending || !pending.isPopping) return;
+      // Fast path: use in-memory pendingRestore (set by popTopFrame in same tab).
+      // This avoids a storage IPC round-trip on every page transition.
+      let pending = pendingRestore;
 
+      // Cold path: if no in-memory restore (e.g. tab was refreshed, or pop came
+      // from popup/background), fall back to reading from storage once.
+      if (!pending) {
+        const data = await chrome.storage.local.get(RESTORE_KEY);
+        pending = data[RESTORE_KEY];
+      }
+
+      if (!pending || !pending.isPopping) return;
       if (Date.now() - (pending.timestampSetAt || 0) > 60000) {
-        await chrome.storage.local.remove(RESTORE_KEY);
+        pendingRestore = null;
+        chrome.storage.local.remove(RESTORE_KEY).catch(() => {});
         return;
       }
 
       const currentVidId = getCurrentVideoId();
       if (!currentVidId || currentVidId !== pending.videoId) return;
 
-      await chrome.storage.local.remove(RESTORE_KEY);
+      // Consume the pending restore.
+      pendingRestore = null;
+      chrome.storage.local.remove(RESTORE_KEY).catch(() => {});
 
       const targetTime = Math.max(0, (pending.savedTimestamp || 0) - 3);
       const targetRate = pending.playbackRate || 1;
 
-      const video = getVideoElement();
-      if (video) {
-        if (video.readyState >= 1) {
-          applyRestore(targetTime, targetRate);
-        } else {
-          video.addEventListener('loadedmetadata', () => applyRestore(targetTime, targetRate), { once: true });
+      // Apply restore immediately
+      applyRestore(targetTime, targetRate);
+      showToast(`Resumed from stack • ${formatTimestamp(targetTime + 3)}`);
+
+      // Ensure timestamp stays at targetTime even if YouTube player resets to 0 on initial stream load
+      let attempts = 0;
+      const verifyTimer = setInterval(() => {
+        attempts++;
+        const v = getVideoElement();
+        if (!v || attempts > 10) {
+          clearInterval(verifyTimer);
+          return;
         }
-        showToast(`Resumed from stack • ${formatTimestamp(targetTime + 3)}`);
-      }
+        if (targetTime > 3 && v.currentTime < 1) {
+          applyRestore(targetTime, targetRate);
+        }
+        if (v.currentTime >= targetTime - 4) {
+          clearInterval(verifyTimer);
+        }
+      }, 120);
     } catch (e) {}
   }
 
@@ -329,15 +411,17 @@
     if (!video || activeVideoEl === video) return;
     activeVideoEl = video;
 
-    video.addEventListener('ended', async () => {
+    video.addEventListener('ended', () => {
       if (!isExtensionValid()) return;
-      try {
-        const data = await chrome.storage.local.get(STORAGE_KEY);
-        const stack = Array.isArray(data[STORAGE_KEY]) ? data[STORAGE_KEY] : [];
-        if (stack.length > 0) {
-          showAutopopCard(stack[0]);
-        }
-      } catch (e) {}
+      const stack = currentStack;
+      if (stack.length > 0) {
+        showAutopopCard(stack[0]);
+      } else {
+        chrome.storage.local.get(STORAGE_KEY).then(data => {
+          const s = Array.isArray(data[STORAGE_KEY]) ? data[STORAGE_KEY] : [];
+          if (s.length > 0) showAutopopCard(s[0]);
+        }).catch(() => {});
+      }
     });
 
     video.addEventListener('play', dismissAutopop);
@@ -349,7 +433,7 @@
 
   function isVideoTarget(target) {
     if (!target) return false;
-    if (target.closest('input, textarea, [contenteditable="true"], .ytp-settings-menu, .ytp-contextmenu')) {
+    if (target.closest('input, textarea, [contenteditable="true"], .ytp-settings-menu, .ytp-contextmenu, .ytp-chrome-bottom')) {
       return false;
     }
     return Boolean(
@@ -386,13 +470,14 @@
           e.stopPropagation();
           e.stopImmediatePropagation();
 
-          pushActiveVideo({ pause: true, showNotification: false });
+          pushActiveVideo({ pause: true, showNotification: false }).catch(() => {});
 
           // Dispatch clean synthetic click on the link without Alt modifier so YouTube routes via SPA
           const clickEvt = new MouseEvent('click', {
             view: window,
             bubbles: true,
             cancelable: true,
+            composed: true,
             altKey: false,
             ctrlKey: false,
             metaKey: false,
@@ -410,7 +495,7 @@
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
-        pushActiveVideo({ pause: true, showNotification: true });
+        pushActiveVideo({ pause: true, showNotification: true }).catch(() => {});
       }
     }
   }
@@ -427,14 +512,14 @@
     if (e.key === 'p' || e.key === 'P' || e.key === 'Backspace') {
       e.preventDefault();
       e.stopPropagation();
-      popTopFrame(0);
+      popTopFrame(0).catch(() => {});
       return;
     }
 
     if (e.key === 's' || e.key === 'S' || e.key === 'c' || e.key === 'C') {
       e.preventDefault();
       e.stopPropagation();
-      pushActiveVideo({ pause: true, showNotification: true });
+      pushActiveVideo({ pause: true, showNotification: true }).catch(() => {});
       return;
     }
   }
@@ -444,7 +529,15 @@
      ========================================================================== */
 
   function ensureShadowRoot() {
-    if (shadowRoot && hostEl && hostEl.isConnected) return shadowRoot;
+    const parent = document.body || document.documentElement;
+    if (!parent) return null;
+
+    if (shadowRoot && hostEl && hostEl.isConnected) {
+      if (!parent.contains(hostEl)) {
+        parent.appendChild(hostEl);
+      }
+      return shadowRoot;
+    }
 
     const existing = document.getElementById('yt-callstack-host');
     if (existing) existing.remove();
@@ -668,6 +761,19 @@
         padding: 6px;
         overflow-y: auto;
         max-height: 340px;
+      }
+      .ytcs-panel-body::-webkit-scrollbar {
+        width: 6px;
+      }
+      .ytcs-panel-body::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      .ytcs-panel-body::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.2);
+        border-radius: 3px;
+      }
+      .ytcs-panel-body::-webkit-scrollbar-thumb:hover {
+        background: rgba(255, 255, 255, 0.35);
       }
 
       .ytcs-empty {
@@ -904,13 +1010,20 @@
     uiContainer.id = 'ytcs-ui-root';
     shadowRoot.appendChild(uiContainer);
 
-    document.body.appendChild(hostEl);
+    parent.appendChild(hostEl);
     return shadowRoot;
   }
 
   function renderDock() {
-    ensureShadowRoot();
-    const uiRoot = shadowRoot.getElementById('ytcs-ui-root');
+    const root = ensureShadowRoot();
+    if (!root) {
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => renderDock(), { once: true });
+      }
+      return;
+    }
+
+    const uiRoot = shadowRoot.querySelector('#ytcs-ui-root');
     if (!uiRoot) return;
 
     const depth = currentStack.length;
@@ -934,19 +1047,25 @@
         </div>
       `;
 
-      shadowRoot.getElementById('ytcs-toggle-expand').addEventListener('click', () => {
-        isDockCollapsed = false;
-        chrome.storage.local.set({ [DOCK_COLLAPSED_KEY]: false });
-        renderDock();
-      });
+      const expandBtn = uiRoot.querySelector('#ytcs-toggle-expand');
+      if (expandBtn) {
+        expandBtn.addEventListener('click', () => {
+          isDockCollapsed = false;
+          if (isExtensionValid()) chrome.storage.local.set({ [DOCK_COLLAPSED_KEY]: false }).catch(() => {});
+          renderDock();
+        });
+      }
 
-      shadowRoot.getElementById('ytcs-quick-push').addEventListener('click', () => {
-        pushActiveVideo({ pause: true, showNotification: true });
-      });
+      const quickPushBtn = uiRoot.querySelector('#ytcs-quick-push');
+      if (quickPushBtn) {
+        quickPushBtn.addEventListener('click', () => {
+          pushActiveVideo({ pause: true, showNotification: true }).catch(() => {});
+        });
+      }
 
-      const popBtn = shadowRoot.getElementById('ytcs-quick-pop');
+      const popBtn = uiRoot.querySelector('#ytcs-quick-pop');
       if (popBtn && depth > 0) {
-        popBtn.addEventListener('click', () => popTopFrame(0));
+        popBtn.addEventListener('click', () => popTopFrame(0).catch(() => {}));
       }
       return;
     }
@@ -1016,34 +1135,40 @@
       </div>
     `;
 
-    shadowRoot.getElementById('ytcs-btn-minimize').addEventListener('click', () => {
-      isDockCollapsed = true;
-      chrome.storage.local.set({ [DOCK_COLLAPSED_KEY]: true });
-      renderDock();
-    });
-
-    const clearBtn = shadowRoot.getElementById('ytcs-btn-clear');
-    if (clearBtn) {
-      clearBtn.addEventListener('click', () => {
-        if (confirm('Clear Call Stack?')) clearStack();
+    const minBtn = uiRoot.querySelector('#ytcs-btn-minimize');
+    if (minBtn) {
+      minBtn.addEventListener('click', () => {
+        isDockCollapsed = true;
+        if (isExtensionValid()) chrome.storage.local.set({ [DOCK_COLLAPSED_KEY]: true }).catch(() => {});
+        renderDock();
       });
     }
 
-    shadowRoot.getElementById('ytcs-panel-push').addEventListener('click', () => {
-      pushActiveVideo({ pause: true, showNotification: true });
-    });
-
-    const popTopBtn = shadowRoot.getElementById('ytcs-panel-pop');
-    if (popTopBtn && depth > 0) {
-      popTopBtn.addEventListener('click', () => popTopFrame(0));
+    const clearBtn = uiRoot.querySelector('#ytcs-btn-clear');
+    if (clearBtn) {
+      clearBtn.addEventListener('click', () => {
+        if (confirm('Clear Call Stack?')) clearStack().catch(() => {});
+      });
     }
 
-    const items = shadowRoot.querySelectorAll('.ytcs-item');
+    const panelPushBtn = uiRoot.querySelector('#ytcs-panel-push');
+    if (panelPushBtn) {
+      panelPushBtn.addEventListener('click', () => {
+        pushActiveVideo({ pause: true, showNotification: true }).catch(() => {});
+      });
+    }
+
+    const panelPopBtn = uiRoot.querySelector('#ytcs-panel-pop');
+    if (panelPopBtn && depth > 0) {
+      panelPopBtn.addEventListener('click', () => popTopFrame(0).catch(() => {}));
+    }
+
+    const items = uiRoot.querySelectorAll('.ytcs-item');
     items.forEach((item) => {
       const idx = parseInt(item.getAttribute('data-index'), 10);
       item.addEventListener('click', (e) => {
         if (e.target.closest('[data-action="delete"]')) return;
-        popTopFrame(idx);
+        popTopFrame(idx).catch(() => {});
       });
 
       const delBtn = item.querySelector('[data-action="delete"]');
@@ -1051,7 +1176,7 @@
         delBtn.addEventListener('click', (e) => {
           e.preventDefault();
           e.stopPropagation();
-          removeFrame(idx);
+          removeFrame(idx).catch(() => {});
         });
       }
     });
@@ -1064,8 +1189,9 @@
   let toastDismissTimer = null;
 
   function showToast(text, actionText = null, actionCallback = null) {
-    ensureShadowRoot();
-    const existing = shadowRoot.getElementById('ytcs-toast');
+    const root = ensureShadowRoot();
+    if (!root) return;
+    const existing = shadowRoot.querySelector('#ytcs-toast');
     if (existing) existing.remove();
 
     if (toastDismissTimer) clearTimeout(toastDismissTimer);
@@ -1104,7 +1230,8 @@
 
   function showAutopopCard(targetFrame) {
     dismissAutopop();
-    ensureShadowRoot();
+    const root = ensureShadowRoot();
+    if (!root) return;
 
     const card = document.createElement('div');
     card.id = 'ytcs-autopop';
@@ -1130,13 +1257,14 @@
     const stayBtn = card.querySelector('#ytcs-autopop-stay');
     const barFill = card.querySelector('#ytcs-autopop-bar-fill');
 
-    nowBtn.addEventListener('click', () => popTopFrame(0));
+    nowBtn.addEventListener('click', () => popTopFrame(0).catch(() => {}));
     stayBtn.addEventListener('click', dismissAutopop);
 
     const duration = 3000;
     const start = Date.now();
 
     autopopInterval = setInterval(() => {
+      if (!isExtensionValid()) { dismissAutopop(); return; }
       const elapsed = Date.now() - start;
       const remaining = Math.max(0, duration - elapsed);
       if (barFill) {
@@ -1144,7 +1272,7 @@
       }
       if (remaining <= 0) {
         dismissAutopop();
-        popTopFrame(0);
+        popTopFrame(0).catch(() => {});
       }
     }, 50);
   }
@@ -1155,7 +1283,7 @@
       autopopInterval = null;
     }
     if (shadowRoot) {
-      const card = shadowRoot.getElementById('ytcs-autopop');
+      const card = shadowRoot.querySelector('#ytcs-autopop');
       if (card) card.remove();
     }
   }
@@ -1165,9 +1293,10 @@
      ========================================================================== */
 
   function onPageTransition() {
+    if (!isExtensionValid()) return;
     dismissAutopop();
     attachVideoEvents();
-    checkAndApplyPendingRestore();
+    checkAndApplyPendingRestore().catch(() => {});
     renderDock();
   }
 
@@ -1183,16 +1312,17 @@
   // Cross-context messaging
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === 'TRIGGER_POP') {
-      popTopFrame(0).then(() => sendResponse({ handled: true }));
+      const idx = typeof message.index === 'number' ? message.index : 0;
+      popTopFrame(idx).then(() => sendResponse({ handled: true })).catch(() => sendResponse({ handled: false }));
       return true;
     }
     if (message.action === 'TRIGGER_PUSH') {
-      pushActiveVideo({ pause: true, showNotification: true }).then(() => sendResponse({ success: true }));
+      pushActiveVideo({ pause: true, showNotification: true }).then(() => sendResponse({ success: true })).catch(() => sendResponse({ success: false }));
       return true;
     }
   });
 
   // Initial load
-  loadState();
+  loadState().catch(() => {});
   onPageTransition();
 })();

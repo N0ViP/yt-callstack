@@ -152,9 +152,9 @@ async function unwindAndResume(targetIndex = 0) {
   targetUrl.searchParams.set('t', `${Math.floor(targetTimestamp)}s`);
 
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (targetIndex === 0 && activeTab && activeTab.id && activeTab.url && activeTab.url.includes('youtube.com')) {
+  if (activeTab && activeTab.id && activeTab.url && activeTab.url.includes('youtube.com')) {
     try {
-      const res = await chrome.tabs.sendMessage(activeTab.id, { action: 'TRIGGER_POP' });
+      const res = await chrome.tabs.sendMessage(activeTab.id, { action: 'TRIGGER_POP', index: targetIndex });
       if (res && res.handled) {
         window.close();
         return;
